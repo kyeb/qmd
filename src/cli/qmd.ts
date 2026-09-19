@@ -3,6 +3,7 @@ import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
 import { isQmdMcpPid, mcpDaemonStateFiles } from "./mcp-pid.js";
+import { daemonBaseUrl, daemonDisabledByEnv, discoverDaemon, readDaemonDiscovery, searchViaDaemon, type DaemonSearchRequest } from "./daemon-client.js";
 import { embedLockPathForDb, tryAcquireEmbedLock, EMBED_LOCK_BUSY_MESSAGE } from "./embed-lock.js";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
@@ -208,16 +209,24 @@ function getActiveIndexName(): string {
   return currentIndexName;
 }
 
-function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string } {
+function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string; portPath: string } {
   const cacheDir = process.env.XDG_CACHE_HOME
     ? resolve(process.env.XDG_CACHE_HOME, "qmd")
     : resolve(homedir(), ".cache", "qmd");
-  const { pidFile, logFile } = mcpDaemonStateFiles(getActiveIndexName());
+  const { pidFile, logFile, portFile } = mcpDaemonStateFiles(getActiveIndexName());
   return {
     cacheDir,
     pidPath: resolve(cacheDir, pidFile),
     logPath: resolve(cacheDir, logFile),
+    portPath: resolve(cacheDir, portFile),
   };
+}
+
+// Only vsearch/query ask for this. BM25 search loads no models, and the hop
+// costs more than it saves.
+async function daemonForSearch(opts: OutputOptions): Promise<string | null> {
+  if (opts.noDaemon || daemonDisabledByEnv()) return null;
+  return discoverDaemon(mcpDaemonPaths().portPath, getDbPath());
 }
 
 function setIndexName(name: string | null): void {
@@ -554,7 +563,9 @@ async function showStatus(): Promise<void> {
   if (existsSync(mcpPidPath)) {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
     if (isQmdMcpPid(mcpPid)) {
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+      const discovery = readDaemonDiscovery(mcpDaemonPaths().portPath);
+      const url = discovery && discovery.pid === mcpPid ? ` at ${daemonBaseUrl(discovery)}` : "";
+      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})${url}`);
     } else {
       try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
       // Stale / recycled PID file cleaned up silently
@@ -2346,6 +2357,7 @@ type OutputOptions = {
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
   filter?: MetadataFilter;  // Metadata filter (--filter JSON)
+  noDaemon?: boolean;    // vsearch/query: never route through a running `qmd mcp --http` (--no-daemon)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2912,6 +2924,36 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   checkIndexHealth(store.db);
   if (opts.filter) warnPendingMetadata(store.db);
 
+  const vsearchRequest: DaemonSearchRequest = {
+    mode: "vsearch",
+    query,
+    collections: collectionNames,
+    filter: opts.filter,
+    limit: opts.all ? 500 : (opts.limit || 10),
+    minScore: opts.minScore || 0.3,
+    intent: opts.intent,
+  };
+  const daemon = await daemonForSearch(opts);
+  const viaDaemon = daemon ? await searchViaDaemon(daemon, vsearchRequest) : null;
+  if (viaDaemon) {
+    closeDb();
+    if (viaDaemon.length === 0) {
+      printEmptySearchResults(opts.format);
+      return;
+    }
+    outputResults(viaDaemon.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+      metadata: r.metadata as DocumentMetadata,
+    })), query, { ...opts, limit: viaDaemon.length });
+    return;
+  }
+
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
@@ -2961,6 +3003,49 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   const parsed = parseStructuredQuery(query);
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
+
+  // Use first lex/vec query for output context, or original query
+  const displayQuery = parsed
+    ? (parsed.searches.find(s => s.type === 'lex')?.query || parsed.searches.find(s => s.type === 'vec')?.query || query)
+    : query;
+
+  const queryRequest: DaemonSearchRequest = {
+    mode: "query",
+    query,
+    searches: parsed?.searches,
+    collections: collectionNames,
+    filter: opts.filter,
+    limit: opts.all ? 500 : (opts.limit || 10),
+    minScore: opts.minScore || 0,
+    candidateLimit: opts.candidateLimit,
+    skipRerank: opts.skipRerank,
+    explain: !!opts.explain,
+    intent,
+    chunkStrategy: opts.chunkStrategy,
+  };
+  const daemon = await daemonForSearch(opts);
+  const viaDaemon = daemon ? await searchViaDaemon(daemon, queryRequest) : null;
+  if (viaDaemon) {
+    closeDb();
+    if (viaDaemon.length === 0) {
+      printEmptySearchResults(opts.format);
+      return;
+    }
+    outputResults(viaDaemon.map(r => ({
+      file: r.file,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body,
+      chunkPos: r.bestChunkPos,
+      chunkLen: r.bestChunkLen,
+      score: r.score,
+      context: r.context,
+      docid: r.docid,
+      metadata: r.metadata as DocumentMetadata,
+      explain: r.explain as HybridQueryExplain | undefined,
+    })), displayQuery, { ...opts, limit: viaDaemon.length });
+    return;
+  }
 
   await withLLMSession(async () => {
     let results;
@@ -3058,12 +3143,6 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       return;
     }
 
-    // Use first lex/vec query for output context, or original query
-    const structuredQueries = parsed?.searches;
-    const displayQuery = structuredQueries
-      ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
-      : query;
-
     outputResults(results.map(r => ({
       file: r.file,
       displayPath: r.displayPath,
@@ -3138,6 +3217,7 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      "no-daemon": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -3212,6 +3292,7 @@ function parseCLI() {
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
     fullPath: !!values["full-path"],
+    noDaemon: !!values["no-daemon"],
   };
 
   return {
@@ -3721,6 +3802,7 @@ function showHelp(): void {
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
+  console.log("  --no-daemon                - Run vsearch/query in-process even if `qmd mcp --http` is running (same as QMD_NO_DAEMON=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
   console.log("  --full-path                - Show on-disk paths instead of qmd:// + docid (get/multi-get/search/query)");
@@ -3865,7 +3947,8 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
   add("QMD_CONFIG_DIR", "overrides the QMD config directory and takes precedence over XDG_CONFIG_HOME");
   add("XDG_CONFIG_HOME", "moves QMD config to $XDG_CONFIG_HOME/qmd when QMD_CONFIG_DIR is not set");
-  add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
+  add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID/port files");
+  add("QMD_NO_DAEMON", "disables routing vsearch/query through a running `qmd mcp --http`; every command loads models in-process");
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
@@ -4814,7 +4897,8 @@ if (isMain) {
 
       // Cache dir for PID/log files — scoped per --index so named daemons
       // do not collide with the default index (#772).
-      const { cacheDir, pidPath, logPath } = mcpDaemonPaths();
+      const { cacheDir, pidPath, logPath, portPath } = mcpDaemonPaths();
+      const removePortFile = () => { try { unlinkSync(portPath); } catch { /* ignore */ } };
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -4831,9 +4915,11 @@ if (isMain) {
         try {
           process.kill(pid, "SIGTERM");
           unlinkSync(pidPath);
+          removePortFile();
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
           try { unlinkSync(pidPath); } catch { /* ignore */ }
+          removePortFile();
           console.log("Cleaned up stale PID file (server was not running).");
         }
         process.exit(0);
@@ -4901,7 +4987,7 @@ if (isMain) {
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          await startMcpHttpServer(port, { dbPath: getDbPath(), host, discoveryFile: portPath });
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);

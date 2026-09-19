@@ -9,7 +9,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
@@ -30,7 +30,7 @@ import {
   type MetadataFilter,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import { enableProductionMode, hybridQuery, structuredSearch, vectorSearchQuery, type ChunkStrategy } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 
 // =============================================================================
@@ -864,6 +864,154 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
 }
 
 // =============================================================================
+// CLI fast path (POST /v1/search)
+// =============================================================================
+
+export type CliSearchMode = "vsearch" | "query";
+
+export type CliSearchRequest = {
+  mode: CliSearchMode;
+  query: string;
+  searches?: ExpandedQuery[];
+  collections?: string[];
+  filter?: MetadataFilter;
+  limit: number;
+  minScore: number;
+  candidateLimit?: number;
+  skipRerank?: boolean;
+  explain?: boolean;
+  intent?: string;
+  chunkStrategy?: ChunkStrategy;
+};
+
+const CLI_SEARCH_MODES: ReadonlySet<string> = new Set(["vsearch", "query"]);
+
+export function validateCliSearchRequest(input: unknown): { request: CliSearchRequest } | { error: string } {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return { error: "JSON body must be an object" };
+  }
+  const p = input as Record<string, unknown>;
+  if (typeof p.mode !== "string" || !CLI_SEARCH_MODES.has(p.mode)) {
+    return { error: "Invalid field: mode (vsearch | query)" };
+  }
+  if (typeof p.query !== "string") return { error: "Missing required field: query (string)" };
+  if (typeof p.limit !== "number" || !Number.isFinite(p.limit) || p.limit < 0) {
+    return { error: "Invalid field: limit (non-negative number)" };
+  }
+  if (typeof p.minScore !== "number" || !Number.isFinite(p.minScore)) {
+    return { error: "Invalid field: minScore (number)" };
+  }
+  let searches: ExpandedQuery[] | undefined;
+  if (p.searches !== undefined) {
+    if (!Array.isArray(p.searches)) return { error: "Invalid field: searches (array)" };
+    searches = [];
+    for (const s of p.searches as unknown[]) {
+      if (typeof s !== "object" || s === null) return { error: "Invalid field: searches (objects)" };
+      const { type, query } = s as Record<string, unknown>;
+      if (type !== "lex" && type !== "vec" && type !== "hyde") return { error: "Invalid field: searches[].type" };
+      if (typeof query !== "string") return { error: "Invalid field: searches[].query" };
+      searches.push({ type, query });
+    }
+  }
+  let collections: string[] | undefined;
+  if (p.collections !== undefined) {
+    if (!Array.isArray(p.collections) || !p.collections.every((c) => typeof c === "string")) {
+      return { error: "Invalid field: collections (string array)" };
+    }
+    collections = p.collections as string[];
+  }
+  let filter: MetadataFilter | undefined;
+  if (p.filter !== undefined) {
+    const validation = validateFilterArgument(p.filter);
+    if (validation.error) return { error: validation.error };
+    filter = validation.filter;
+  }
+  const { candidateLimit, intent, chunkStrategy } = p;
+  if (candidateLimit !== undefined && typeof candidateLimit !== "number") return { error: "Invalid field: candidateLimit" };
+  if (intent !== undefined && typeof intent !== "string") return { error: "Invalid field: intent" };
+  if (chunkStrategy !== undefined && chunkStrategy !== "auto" && chunkStrategy !== "regex") {
+    return { error: "Invalid field: chunkStrategy (auto | regex)" };
+  }
+  return {
+    request: {
+      mode: p.mode as CliSearchMode,
+      query: p.query,
+      ...(searches ? { searches } : {}),
+      ...(collections ? { collections } : {}),
+      ...(filter ? { filter } : {}),
+      limit: p.limit,
+      minScore: p.minScore,
+      ...(candidateLimit !== undefined ? { candidateLimit } : {}),
+      ...(p.skipRerank === true ? { skipRerank: true } : {}),
+      ...(p.explain === true ? { explain: true } : {}),
+      ...(intent !== undefined ? { intent } : {}),
+      ...(chunkStrategy !== undefined ? { chunkStrategy } : {}),
+    },
+  };
+}
+
+// The CLI passes a single collection as a string and several as an array.
+function collectionArg(collections: string[] | undefined): string | string[] | undefined {
+  if (!collections || collections.length === 0) return undefined;
+  return collections.length === 1 ? collections[0] : collections;
+}
+
+/** Same dispatch as vsearch/query in cli/qmd.ts, so the rows match what the CLI would produce. */
+export async function runCliSearch(store: QMDStore, req: CliSearchRequest): Promise<Record<string, unknown>[]> {
+  const internal = store.internal;
+  const collection = collectionArg(req.collections);
+  switch (req.mode) {
+    case "vsearch": {
+      const rows = await vectorSearchQuery(internal, req.query, {
+        collection,
+        filter: req.filter,
+        limit: req.limit,
+        minScore: req.minScore,
+        intent: req.intent,
+      });
+      return rows.map((r) => ({
+        file: r.file,
+        displayPath: r.displayPath,
+        title: r.title,
+        body: r.body,
+        score: r.score,
+        context: r.context,
+        docid: r.docid,
+        metadata: r.metadata,
+      }));
+    }
+    case "query": {
+      const common = {
+        filter: req.filter,
+        limit: req.limit,
+        minScore: req.minScore,
+        candidateLimit: req.candidateLimit,
+        skipRerank: req.skipRerank,
+        explain: !!req.explain,
+        intent: req.intent,
+        chunkStrategy: req.chunkStrategy,
+      };
+      const rows = req.searches
+        ? await structuredSearch(internal, req.searches, { ...common, collections: req.collections?.length ? req.collections : undefined })
+        : await hybridQuery(internal, req.query, { ...common, collection });
+      return rows.map((r) => ({
+        file: r.file,
+        displayPath: r.displayPath,
+        title: r.title,
+        body: r.body,
+        bestChunkPos: r.bestChunkPos,
+        bestChunkLen: r.bestChunk.length,
+        score: r.score,
+        context: r.context,
+        docid: r.docid,
+        metadata: r.metadata,
+        ...(r.explain ? { explain: r.explain } : {}),
+      }));
+    }
+  }
+}
+
+// =============================================================================
 // Transport: Streamable HTTP
 // =============================================================================
 
@@ -886,9 +1034,18 @@ export type HttpServerHandle = {
  * or a stdio connection). The previous session reaper (#816) is gone because
  * there are no sessions to reap.
  */
+export type HttpServerOptions = {
+  quiet?: boolean;
+  host?: string;
+  allowedOrigins?: string[];
+  allowedHosts?: string[];
+  /** Written as `{port, host, dbPath, pid}` once listening, removed on stop; the CLI reads it (cli/daemon-client.ts). */
+  discoveryFile?: string;
+} & McpStartupOptions;
+
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: HttpServerOptions = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -1007,10 +1164,41 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        const body = JSON.stringify({
+          status: "ok",
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          dbPath: store.dbPath,
+          pid: process.pid,
+        });
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // REST endpoint: POST /v1/search: the CLI fast path. Returns raw rows for
+      // the CLI's own formatter; kept apart from /query, whose snippet-shaped
+      // response is an agent-facing contract.
+      if (pathname === "/v1/search" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let parsedParams: unknown;
+        try {
+          parsedParams = JSON.parse(rawBody);
+        } catch {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
+        const validated = validateCliSearchRequest(parsedParams);
+        if ("error" in validated) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: validated.error }));
+          return;
+        }
+        const results = await runCliSearch(store, validated.request);
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ results }));
+        log(`${ts()} POST /v1/search ${validated.request.mode} "${validated.request.query.slice(0, 80)}" (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -1152,10 +1340,29 @@ export async function startMcpHttpServer(
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
 
+  const discoveryFile = options.discoveryFile;
+  if (discoveryFile) {
+    try {
+      mkdirSync(dirname(discoveryFile), { recursive: true });
+      writeFileSync(discoveryFile, JSON.stringify({ port: actualPort, host, dbPath: store.dbPath, pid: process.pid }));
+    } catch (err) {
+      log(`Warning: could not write daemon discovery file ${discoveryFile}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const removeDiscoveryFile = () => {
+    if (!discoveryFile) return;
+    try {
+      // Only remove our own record; a newer daemon may have replaced it.
+      const current = JSON.parse(readFileSync(discoveryFile, "utf-8")) as { pid?: unknown };
+      if (current.pid === process.pid) unlinkSync(discoveryFile);
+    } catch { /* already gone */ }
+  };
+
   let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    removeDiscoveryFile();
     await mcpHandler.close();
     httpServer.close();
     await store.close();
