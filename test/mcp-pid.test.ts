@@ -32,15 +32,16 @@ describe("looksLikeQmdMcpCommand", () => {
 
 describe("mcpDaemonStateFiles", () => {
   test("default index keeps mcp.pid / mcp.log", () => {
-    expect(mcpDaemonStateFiles("index")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
-    expect(mcpDaemonStateFiles("")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
-    expect(mcpDaemonStateFiles()).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log" });
+    expect(mcpDaemonStateFiles("index")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log", portFile: "mcp.port" });
+    expect(mcpDaemonStateFiles("")).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log", portFile: "mcp.port" });
+    expect(mcpDaemonStateFiles()).toEqual({ pidFile: "mcp.pid", logFile: "mcp.log", portFile: "mcp.port" });
   });
 
   test("named indexes get scoped pid/log files (#772)", () => {
     expect(mcpDaemonStateFiles("hsm-public-repro")).toEqual({
       pidFile: "mcp-hsm-public-repro.pid",
       logFile: "mcp-hsm-public-repro.log",
+      portFile: "mcp-hsm-public-repro.port",
     });
   });
 });

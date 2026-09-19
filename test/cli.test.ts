@@ -2993,6 +2993,122 @@ describe("mcp http daemon", () => {
       await new Promise<void>((resolve) => decoy.once("close", () => resolve()));
     }
   });
+
+  // -------------------------------------------------------------------------
+  // CLI fast path (vsearch/query route through a running daemon)
+  // -------------------------------------------------------------------------
+
+  // Isolated cache/config/index with the fixtures indexed, no embeddings.
+  async function seedFastPathEnv(tag: string): Promise<{ cacheDir: string; configDir: string; dbPath: string; portPath: string }> {
+    const cacheDir = join(daemonTestDir, `cache-fastpath-${tag}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const configDir = join(daemonTestDir, `config-fastpath-${tag}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const dbPath = join(daemonTestDir, `fastpath-${tag}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`);
+    await mkdir(join(cacheDir, "qmd"), { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const env = { XDG_CACHE_HOME: cacheDir };
+    expect((await runQmd(["collection", "add", fixturesDir, "--name", "fp-fixtures"], { dbPath, configDir, env })).exitCode).toBe(0);
+    expect((await runQmd(["update"], { dbPath, configDir, env })).exitCode).toBe(0);
+    return { cacheDir, configDir, dbPath, portPath: join(cacheDir, "qmd", "mcp.port") };
+  }
+
+  test("--http writes mcp.port on listen and removes it on stop", async () => {
+    const seeded = await seedFastPathEnv("portfile");
+    const port = randomPort();
+    const runner = qmdRunnerArgs(["mcp", "--http", "--port", String(port)]);
+    const proc = spawn(runner.command, runner.args, {
+      cwd: fixturesDir,
+      env: { ...process.env, INDEX_PATH: seeded.dbPath, QMD_CONFIG_DIR: seeded.configDir, XDG_CACHE_HOME: seeded.cacheDir, PWD: fixturesDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (proc.pid) spawnedPids.push(proc.pid);
+    try {
+      expect(await waitForServer(port)).toBe(true);
+      const discovery = JSON.parse(readFileSync(seeded.portPath, "utf-8"));
+      expect(discovery.port).toBe(port);
+      expect(discovery.dbPath).toBe(seeded.dbPath);
+      // Under the tsx runner the server is a grandchild, so compare against
+      // what the server itself reports rather than the spawned pid.
+      const health = await (await fetch(`http://localhost:${port}/health`)).json();
+      expect(health.dbPath).toBe(seeded.dbPath);
+      expect(health.pid).toBe(discovery.pid);
+      expect(() => process.kill(discovery.pid, 0)).not.toThrow();
+
+      const bad = await fetch(`http://localhost:${port}/v1/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "nope", query: "x", limit: 5, minScore: 0 }),
+      });
+      expect(bad.status).toBe(400);
+    } finally {
+      const closed = new Promise(r => proc.once("close", r));
+      proc.kill("SIGTERM");
+      await closed;
+    }
+    expect(existsSync(seeded.portPath)).toBe(false);
+  }, 20000);
+
+  test("query routes through the daemon; opt-outs and mismatches fall through", async () => {
+    const seeded = await seedFastPathEnv("route");
+    const port = randomPort();
+    const runner = qmdRunnerArgs(["mcp", "--http", "--port", String(port)]);
+    const proc = spawn(runner.command, runner.args, {
+      cwd: fixturesDir,
+      env: { ...process.env, INDEX_PATH: seeded.dbPath, QMD_CONFIG_DIR: seeded.configDir, XDG_CACHE_HOME: seeded.cacheDir, PWD: fixturesDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (proc.pid) spawnedPids.push(proc.pid);
+    try {
+      expect(await waitForServer(port)).toBe(true);
+      // lex-only structured query with --no-rerank needs no models, so this
+      // runs everywhere; the routing decision is what is under test.
+      const args = ["query", "lex: authentication", "--no-rerank", "--json", "-n", "5"];
+      const baseEnv = { XDG_CACHE_HOME: seeded.cacheDir, QMD_DEBUG: "1" };
+
+      const routed = await runQmd(args, { dbPath: seeded.dbPath, configDir: seeded.configDir, env: baseEnv });
+      expect(routed.exitCode).toBe(0);
+      expect(routed.stderr).toContain(`routing via http://localhost:${port}`);
+      const routedRows = JSON.parse(routed.stdout);
+      expect(routedRows.some((r: { file: string }) => r.file.includes("notes/meeting.md"))).toBe(true);
+
+      const direct = await runQmd([...args, "--no-daemon"], { dbPath: seeded.dbPath, configDir: seeded.configDir, env: baseEnv });
+      expect(direct.exitCode).toBe(0);
+      expect(direct.stderr).not.toContain("routing via");
+      expect(direct.stdout).toBe(routed.stdout);
+
+      const envOptOut = await runQmd(args, { dbPath: seeded.dbPath, configDir: seeded.configDir, env: { ...baseEnv, QMD_NO_DAEMON: "1" } });
+      expect(envOptOut.exitCode).toBe(0);
+      expect(envOptOut.stderr).not.toContain("routing via");
+      expect(envOptOut.stdout).toBe(routed.stdout);
+
+      // A daemon serving a different index is ignored: same port file, CLI
+      // pointed at another database.
+      const other = await seedFastPathEnv("other");
+      const mismatch = await runQmd(args, { dbPath: other.dbPath, configDir: other.configDir, env: { XDG_CACHE_HOME: seeded.cacheDir, QMD_DEBUG: "1" } });
+      expect(mismatch.exitCode).toBe(0);
+      expect(mismatch.stderr).not.toContain("routing via");
+      expect(mismatch.stderr).toContain(`serves ${seeded.dbPath}, not ${other.dbPath}`);
+    } finally {
+      const closed = new Promise(r => proc.once("close", r));
+      proc.kill("SIGTERM");
+      await closed;
+    }
+
+    // Daemon gone, port file gone: the same command falls through silently.
+    const after = await runQmd(["query", "lex: authentication", "--no-rerank", "--json", "-n", "5"], { dbPath: seeded.dbPath, configDir: seeded.configDir, env: { XDG_CACHE_HOME: seeded.cacheDir, QMD_DEBUG: "1" } });
+    expect(after.exitCode).toBe(0);
+    expect(after.stderr).not.toContain("routing via");
+  }, 30000);
+
+  test("stale mcp.port falls through to in-process search", async () => {
+    const seeded = await seedFastPathEnv("stale");
+    writeFileSync(seeded.portPath, JSON.stringify({ port: 1, host: "localhost", dbPath: seeded.dbPath, pid: 999999 }));
+    const result = await runQmd(["query", "lex: authentication", "--no-rerank", "--json", "-n", "5"], { dbPath: seeded.dbPath, configDir: seeded.configDir, env: { XDG_CACHE_HOME: seeded.cacheDir, QMD_DEBUG: "1" } });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("unreachable");
+    expect(JSON.parse(result.stdout).length).toBeGreaterThan(0);
+  }, 20000);
+
 });
 
 // =============================================================================
