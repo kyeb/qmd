@@ -149,10 +149,23 @@ The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
 
-The HTTP server exposes two endpoints:
+The HTTP server exposes these endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
 - `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
-- `GET /health` — liveness check with uptime
+- `POST /v1/search`: the CLI fast path (below), raw result rows for `vsearch`/`query`
+- `GET /health`: liveness check with uptime, `dbPath` and `pid`
+
+##### CLI fast path
+
+While `qmd mcp --http` is serving an index, `qmd vsearch` and `qmd query`
+against that index run through it instead of loading the models in-process.
+The server writes `~/.cache/qmd/mcp.port` (scoped per `--index` like `mcp.pid`)
+once it is listening and removes it on shutdown; the CLI probes `GET /health`
+with a 200 ms budget and routes only when the reported `dbPath` matches its
+own. Output is identical either way, and any failure (no file, daemon gone,
+different index, HTTP error) falls through silently to the in-process search.
+BM25 `qmd search` is not routed: it loads no models. Opt out with `--no-daemon`
+or `QMD_NO_DAEMON=1`; `QMD_DEBUG=1` prints the routing decision to stderr.
 
 
 ##### Origin and Host validation
