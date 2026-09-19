@@ -10,15 +10,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
 /**
- * Pid/log filenames for the MCP HTTP daemon.
+ * Pid/log/port filenames for the MCP HTTP daemon.
  * The default index keeps `mcp.pid` / `mcp.log` for compatibility; named
  * indexes are scoped so a named daemon can run alongside the default (#772).
+ * `mcp.port` is the discovery file the CLI reads to route searches through a
+ * running HTTP server (see cli/daemon-client.ts).
  */
-export function mcpDaemonStateFiles(indexName: string = "index"): { pidFile: string; logFile: string } {
+export function mcpDaemonStateFiles(indexName: string = "index"): { pidFile: string; logFile: string; portFile: string } {
   const suffix = !indexName || indexName === "index" ? "" : `-${indexName}`;
   return {
     pidFile: `mcp${suffix}.pid`,
     logFile: `mcp${suffix}.log`,
+    portFile: `mcp${suffix}.port`,
   };
 }
 
